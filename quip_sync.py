@@ -7,6 +7,8 @@ import requests
 from quip import QuipClient
 import hashlib
 import json
+import re
+import mimetypes
 
 def get_domain_from_link(url):
     """Extract domain from a Quip URL"""
@@ -102,11 +104,148 @@ def create_folder_structure(client, folder_path, parent_id):
 
     return current_folder_id
 
+def upload_image_to_quip(client, image_path, thread_id=None):
+    """Upload an image to Quip and return the blob ID"""
+    if not os.path.exists(image_path):
+        print(f"Error: Image file not found: {image_path}")
+        return None
+    
+    if not thread_id:
+        print("Error: No thread ID provided for image upload")
+        return None
+    
+    try:
+        # Get image filename
+        image_name = os.path.basename(image_path)
+        
+        # Determine MIME type
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type:
+            # Default to JPEG if can't determine
+            mime_type = 'image/jpeg'
+        
+        # Open image file
+        with open(image_path, 'rb') as f:
+            # Upload blob to the thread
+            print(f"Uploading image: {image_path} to thread: {thread_id}")
+            response = retry_api_call(
+                client.put_blob,
+                thread_id,
+                f,
+                name=image_name
+            )
+            
+            if 'id' in response:
+                print(f"Image uploaded successfully, blob ID: {response['id']}")
+                print(f"Image URL: {response['url']}")
+                return response['id']
+            else:
+                print(f"Error uploading image: {response}")
+                return None
+    except Exception as e:
+        print(f"Error uploading image {image_path}: {e}")
+        return None
 
+def preprocess_markdown_for_images(content, base_dir):
+    """Preprocess markdown content to replace image references with a special pattern
+    
+    This function:
+    1. Finds all markdown image references: ![alt_text](image_path)
+    2. Replaces them with: ####image path: (image_path)
+    3. Returns the modified content
+    """
+    # Find all markdown image references
+    image_pattern = r'!\[(.*?)\]\((.*?)\)'
+    
+    def replace_image(match):
+        image_path = match.group(2)
+        # Create the special pattern
+        return f"####image path: ({image_path})"
+    
+    # Replace all image references
+    processed_content = re.sub(image_pattern, replace_image, content)
+    return processed_content
 
+def process_images_after_upload(client, thread_id, base_dir):
+    """Process images in a Quip document after uploading markdown
+    
+    This function:
+    1. Gets the HTML content of the document
+    2. Finds special image patterns in the HTML
+    3. Uploads each image to Quip as a blob
+    4. Updates the document with the image blobs
+    """
+    if not thread_id:
+        print("Error: No thread ID provided for image processing")
+        return False
+    
+    try:
+        # Get the document HTML
+        thread_data = retry_api_call(client.get_thread, thread_id)
+        html = thread_data.get('html', '')
+        
+        if not html:
+            print("Warning: Document has no HTML content")
+            return True
+        
+        # Find our special image pattern in the HTML
+        pattern = r'image path:\s*\(([^)]+)\)'
+        image_matches = re.findall(pattern, html)
+        
+        if not image_matches:
+            print("No image patterns found in document")
+            return True
+        
+        print(f"Found {len(image_matches)} image patterns in document")
+        
+        # Process each image
+        processed_images = 0
+        
+        for image_path in image_matches:
+            # Handle relative paths
+            if not os.path.isabs(image_path):
+                full_image_path = os.path.join(base_dir, image_path)
+            else:
+                full_image_path = image_path
+                
+            if not os.path.exists(full_image_path):
+                print(f"Warning: Image file not found: {full_image_path}")
+                continue
+                
+            # Upload the image to Quip
+            blob_id = upload_image_to_quip(client, full_image_path, thread_id)
+            if not blob_id:
+                print(f"Warning: Failed to upload image: {full_image_path}")
+                continue
+
+            content = f"<img src=/blob/{thread_id}/{blob_id}>"
+            try: 
+                retry_api_call(
+                    client.edit_document,
+                    thread_id=thread_id,
+                    content=content,
+                    document_range=f"image path: ({image_path})",
+                    location=7
+                )
+            except Exception as e:
+                print(f"Error adding the image {image_path}: {e}")
+            processed_images += 1
+            print(f"Added image: {image_path} with blob: {blob_id}")
+        
+        return True
+    except Exception as e:
+        print(f"Error processing images after upload: {e}")
+        return False
 
 def sync_file(client, file_path, quip_folder_id, cache):
     """Sync a single file to Quip"""
+    ##########################################
+    ##### Check whether need to update #######
+    ##########################################
+        
+    # Check if we need to update the document
+    need_update = True
+
     file_hash = get_file_hash(file_path)
     if file_hash is None:
         return cache
@@ -123,6 +262,10 @@ def sync_file(client, file_path, quip_folder_id, cache):
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
+        
+        # Preprocess markdown content to replace image references with special pattern
+        base_dir = os.path.dirname(file_path)
+        content = preprocess_markdown_for_images(content, base_dir)
     except Exception as e:
         print(f"Error reading file {file_path}: {e}")
         return cache
@@ -143,7 +286,7 @@ def sync_file(client, file_path, quip_folder_id, cache):
             print(f"Error accessing cached document ID {doc_id}: {e}")
             doc_id = None
     
-    # If no cached ID or it's invalid, search in the folder
+    # If no cached ID or it's invalid, search in the folder (TODO: might be redundant due to feature update)
     if not doc_id:
         folder_content = retry_api_call(client.get_folder, quip_folder_id)
         for child in folder_content['children']:
@@ -158,71 +301,108 @@ def sync_file(client, file_path, quip_folder_id, cache):
                     # Skip this thread if we can't access it
                     continue
     
-    # Check if we need to update the document
-    need_update = True
-    if file_hash == cached_hash and doc_id:
-        # File hasn't changed locally, so no need to update
-        print(f"File {file_path} unchanged, skipping...")
-        need_update = False
+    # Get sync status from cache
+    sync_success = cached_info.get('sync_success', False)
     
+    if file_hash == cached_hash and doc_id and sync_success:
+        # File hasn't changed locally and last sync was successful, so no need to update
+        print(f"File {file_path} unchanged and previously synced successfully, skipping...")
+        need_update = False
+    elif file_hash == cached_hash and doc_id and not sync_success:
+        # File hasn't changed but last sync failed, so we need to try again
+        print(f"File {file_path} unchanged but previous sync failed, retrying...")
+        need_update = True
+    
+    ##########################################
+    ######## Begin to sync the file. #########
+    ##########################################
+    sync_success = False
     if need_update:
         if doc_id:
             print(f"Updating existing document: {name_without_ext}")
-            # First get the existing document to check if we need to preserve comments
             try:
+                # First check if the document has any content
                 existing_thread = retry_api_call(client.get_thread, doc_id)
-                # First delete all content by finding all section IDs
                 html = existing_thread.get('html', '')
-                import re
-                section_ids = re.findall(r'id=[\'"]([^\'"]+)[\'"]', html)
+                
+                if html and '<h1' in html:
+                    # Document has content with headings, use document_range to delete all content
+                    # Find the first heading
+                    first_heading_match = re.search(r'<h1[^>]*>(.*?)</h1>', html)
                     
-                # If we found sections, delete them one by one
-                if section_ids:
-                    print(f"Deleting {len(section_ids)} sections from document")
-                    # Delete each section one by one
-                    for section_id in section_ids:
+                    if first_heading_match:
+                        first_heading = first_heading_match.group(1)
+                        print(f"Deleting all content under heading: {first_heading}")
+                        
+                        # Delete all content using document_range
                         try:
                             retry_api_call(
                                 client.edit_document,
                                 thread_id=doc_id,
-                                section_id=section_id,
-                                content=" ",  # Empty content to delete the section
-                                location=5  # DELETE_SECTION
+                                document_range=first_heading,
+                                content="",  # Empty content to delete
+                                location=9  # DELETE_DOCUMENT_RANGE
                             )
                         except Exception as e:
-                            # Continue with other sections if one fails
-                            print(f"Error deleting section {section_id}: {e}")
-                            continue
-                    
-                # Now add the new content
+                            print(f"Error deleting document range: {e}")
+                
+                # Now add the new content (either the document was emptied or had no headings)
                 retry_api_call(
-                        client.edit_document,
-                        thread_id=doc_id,
-                        content=content,
-                        format='markdown',
-                        location=1  # PREPEND (add to beginning of now-empty document)
-                    )
+                    client.edit_document,
+                    thread_id=doc_id,
+                    content=content,
+                    format='markdown',
+                    location=1  # PREPEND (add to beginning of now-empty document)
+                )
+                
+                # Process images after uploading the markdown content
+                base_dir = os.path.dirname(file_path)
+                sync_success=True
+                if process_images_after_upload(client, doc_id, base_dir):
+                    sync_success = True
+                else:
+                    print("Warning: Image processing failed, but document was updated")
+                    sync_success = False  # Still consider it a success since the document was updated
+                print(f"#Successfully Sync existing document: {name_without_ext}")
             except Exception as e:
                 print(f"Error updating document: {e}")
-                return cache
+                # Don't return here, update cache with sync_success=False
         else:
             print(f"Creating new document: {name_without_ext}")
-            result = retry_api_call(
-                client.new_document,
-                content=content,
-                format='markdown',
-                title=name_without_ext,
-                member_ids=[quip_folder_id]
-            )
-            doc_id = result.get('thread', {}).get('id')
-            if not doc_id:
-                print(f"Error: Failed to get document ID for new document")
-                return cache
+            try:
+                # Create the document with the markdown content
+                result = retry_api_call(
+                    client.new_document,
+                    content=content,
+                    format='markdown',
+                    title=name_without_ext,
+                    member_ids=[quip_folder_id]
+                )
+                doc_id = result.get('thread', {}).get('id')
+                
+                if doc_id:
+                    # Process images after uploading the markdown content
+                    base_dir = os.path.dirname(file_path)
+                    if process_images_after_upload(client, doc_id, base_dir):
+                        sync_success = True
+                    else:
+                        print("Warning: Image processing failed, but document was created")
+                        sync_success = False  # Still consider it a success since the document was created
+                    print(f"#Successfully Sync existing document: {name_without_ext}")
+                else:
+                    print(f"Error: Failed to get document ID for new document")
+            except Exception as e:
+                print(f"Error creating document: {e}")
+    else:
+        # If no update needed, consider it a successful sync
+        sync_success = True
 
-    # Store file hash and document ID in cache
+    # Store file hash, document ID, and sync status in cache
     cache[file_path] = {
         'hash': file_hash,
-        'doc_id': doc_id
+        'doc_id': doc_id,
+        'last_sync': time.time(),
+        'sync_success': sync_success
     }
     return cache
 
@@ -271,7 +451,7 @@ def clear_quip_folder(client, folder_id):
                 subfolder_data = retry_api_call(client.get_folder, subfolder_id)
                 subfolder_title = subfolder_data.get('folder', {}).get('title', 'Unknown_Folder')
                 print(f"Clearing subfolder: {subfolder_title}")
-                clear_quip_folder(client, subfolder_id) # Currently, Quip doesn't provide API to remove a folder
+                clear_quip_folder(client, subfolder_id) # TODO: Currently, Quip doesn't provide API to remove a folder
         return True
     except Exception as e:
         print(f"Error clearing folder: {e}")
