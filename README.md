@@ -1,6 +1,6 @@
 # Quip Markdown Sync
 
-A tool to synchronize local markdown files with Quip documents.
+A tool to synchronize local markdown files with Quip documents, including images.
 
 ## Setup
 
@@ -42,6 +42,8 @@ This will:
 ## Features
 
 - Syncs markdown files to Quip documents
+- **Seamlessly handles images in markdown files**
+- **Automatically uploads images to Quip and embeds them in documents**
 - Maintains folder structure
 - Only updates files that have changed (using file hash comparison)
 - Creates new documents for new files
@@ -59,11 +61,38 @@ The script maintains a cache file (`.quip_sync_cache.json`) in your local folder
 - Which files have been synced
 - Their content hashes (to detect changes)
 - Document IDs in Quip (to prevent duplicates and track deletions)
+- Sync status to retry failed operations
 
 The cache allows the script to:
 1. Skip unchanged files for faster syncing
 2. Update the correct documents when files change
 3. Delete Quip documents when local files are deleted
+4. Retry failed operations automatically
+
+## Image Handling
+
+The tool provides robust support for images in markdown files:
+
+1. **Automatic Image Detection**: Finds all image references in markdown (`![alt text](image_path)`)
+2. **Seamless Upload**: Uploads images to Quip's blob storage
+3. **Proper Embedding**: Replaces markdown image syntax with properly formatted Quip image elements
+4. **Relative Path Support**: Handles both relative and absolute image paths
+5. **Formatting Preservation**: Maintains proper image formatting and layout in Quip
+
+Example markdown with images:
+```markdown
+# My Document
+
+Here's an image:
+
+![Sample Image](images/diagram.png)
+
+And another one:
+
+![Another Image](./screenshots/screenshot.jpg)
+```
+
+Both images will be automatically uploaded and embedded in the Quip document with proper formatting.
 
 ## Implementation Details
 
@@ -72,3 +101,5 @@ The cache allows the script to:
 - Handles API rate limits with configurable delays
 - Implements exponential backoff for handling timeouts
 - Properly deletes all sections before adding new content to ensure clean updates
+- Uses Quip's document range feature for efficient content replacement
+- Special handling for images to ensure proper embedding in Quip
